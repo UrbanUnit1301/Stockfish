@@ -36,6 +36,7 @@
 #include "memory.h"
 #include "movegen.h"
 #include "search.h"
+#include "thread_selection.h"
 #include "syzygy/tbprobe.h"
 #include "timeman.h"
 #include "types.h"
@@ -353,55 +354,67 @@ void ThreadPool::start_thinking(const OptionsMap&  options,
 
 Thread* ThreadPool::get_best_thread() const {
 
-    Thread* bestThread = threads.front().get();
-    Value   minScore   = VALUE_INFINITE;
+    std::vector<RootObservation> observations;
+    observations.reserve(threads.size());
 
-    std::unordered_map<Move, i64, Move::MoveHash> votes(
-      2 * std::min(size(), bestThread->worker->rootMoves.size()));
-
-    for (auto&& th : threads)
-        minScore = std::min(minScore, th->worker->rootMoves[0].score);
-
-    // Vote according to score, and select the best thread
-    for (auto&& th : threads)
-        votes[th->worker->rootMoves[0].pv[0]] += th->worker->rootMoves[0].score - minScore + 14;
+    bool haveStatistics = threads.size() > 1;
 
     for (auto&& th : threads)
     {
-        const auto& bestThreadMove = bestThread->worker->rootMoves[0];
-        const auto& newThreadMove  = th->worker->rootMoves[0];
+        const auto& rootMoves = th->worker->rootMoves;
 
-        const auto bestThreadMoveVote = votes[bestThreadMove.pv[0]];
-        const auto newThreadMoveVote  = votes[newThreadMove.pv[0]];
+        if (rootMoves.size() < 2 || rootMoves[0].averageScore == -VALUE_INFINITE
+            || rootMoves[1].averageScore == -VALUE_INFINITE
+            || rootMoves[0].meanSquaredScore == -VALUE_INFINITE * VALUE_INFINITE)
+            haveStatistics = false;
 
-        // Aborted (d1) searches may lead to inexact win (or loss) scores.
-        const bool bestThreadDecisive = bestThreadMove.score != -VALUE_INFINITE
-                                     && is_decisive(bestThreadMove.score)
-                                     && !bestThreadMove.is_inexact();
-        const bool newThreadDecisive = newThreadMove.score != -VALUE_INFINITE
-                                    && is_decisive(newThreadMove.score)
-                                    && !newThreadMove.is_inexact();
+        const double mean         = double(rootMoves[0].averageScore);
+        const double secondMoment = double(rootMoves[0].meanSquaredScore);
+        const double variance     = std::max(1.0, std::abs(secondMoment) - mean * mean);
+        const double iterations   = double(std::max(1, int(th->worker->rootDepth)));
 
-        if (bestThreadDecisive)
-        {
-            // Make sure we pick the shortest mate / TB conversion.
-            if (newThreadDecisive && std::abs(newThreadMove.score) > std::abs(bestThreadMove.score))
-            {
-                assert((is_win(bestThreadMove.score) && is_win(newThreadMove.score))
-                       || (is_loss(bestThreadMove.score) && is_loss(newThreadMove.score)));
-
-                bestThread = th.get();
-            }
-        }
-        else if (newThreadDecisive
-                 || (!is_loss(newThreadMove.score)
-                     && (newThreadMoveVote > bestThreadMoveVote
-                         || (newThreadMoveVote == bestThreadMoveVote
-                             && newThreadMove.pv.size() > bestThreadMove.pv.size()))))
-            bestThread = th.get();
+        observations.push_back({rootMoves[0].pv[0], double(rootMoves[0].score), variance,
+                                mean - double(rootMoves[1].averageScore),
+                                std::sqrt(2.0 * variance / iterations), rootMoves[0].pv.size()});
     }
 
-    return bestThread;
+    const ThreadSelection weighting =
+      haveStatistics ? ThreadSelection::Competence : ThreadSelection::Vote;
+    const std::vector<double> weights = weighted_votes(observations, weighting);
+
+    usize bestIndex = 0;
+
+    for (usize index = 1; index < threads.size(); ++index)
+    {
+        const auto& bestMove = threads[bestIndex]->worker->rootMoves[0];
+        const auto& newMove  = threads[index]->worker->rootMoves[0];
+
+        // Aborted (d1) searches may lead to inexact win (or loss) scores.
+        const bool bestMoveDecisive = bestMove.score != -VALUE_INFINITE
+                                   && is_decisive(bestMove.score) && !bestMove.is_inexact();
+        const bool newMoveDecisive = newMove.score != -VALUE_INFINITE
+                                  && is_decisive(newMove.score) && !newMove.is_inexact();
+
+        if (bestMoveDecisive)
+        {
+            // Make sure we pick the shortest mate / TB conversion.
+            if (newMoveDecisive && std::abs(newMove.score) > std::abs(bestMove.score))
+            {
+                assert((is_win(bestMove.score) && is_win(newMove.score))
+                       || (is_loss(bestMove.score) && is_loss(newMove.score)));
+
+                bestIndex = index;
+            }
+        }
+        else if (newMoveDecisive
+                 || (!is_loss(newMove.score)
+                     && (weights[index] > weights[bestIndex]
+                         || (weights[index] == weights[bestIndex]
+                             && newMove.pv.size() > bestMove.pv.size()))))
+            bestIndex = index;
+    }
+
+    return threads[bestIndex].get();
 }
 
 
