@@ -27,12 +27,10 @@
 #include <map>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
 #include "bitboard.h"
-#include "history.h"
 #include "memory.h"
 #include "movegen.h"
 #include "search.h"
